@@ -224,10 +224,10 @@ class KiroAcpAdapter extends LlmAdapter {
     if (this.loading) return this.loading
     this.loading = (async () => {
       try {
-        const [catalogText, usage] = await Promise.all([
-          runKiroCommand(this.ctx, ['chat', '--list-models', '--format', 'json-pretty']),
-          this.discoverUsage(),
-        ])
+        // Kiro CLI commands share local account/session state. Run them in
+        // sequence so model discovery cannot collide with the usage query.
+        const catalogText = await runKiroCommand(this.ctx, ['chat', '--list-models', '--format', 'json-pretty'])
+        const usage = await this.discoverUsage()
         const catalog = JSON.parse(catalogText)
         const models = Array.isArray(catalog?.models)
           ? catalog.models.filter((item: any) => typeof item?.model_id === 'string' && typeof item?.model_name === 'string')
