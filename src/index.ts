@@ -81,9 +81,11 @@ class KiroAcpAdapter extends LlmAdapter {
     try {
       activation = await this.ctx.subagents.startActivation({
         provider: ACP_PROVIDER,
-        parent,
-        prompt: [{ type: 'text', text: transcript(options) }],
         label: 'Kiro model response',
+        request: {
+          prompt: [{ type: 'text', text: transcript(options) }],
+          parent
+        },
         signal,
         delivery: 'caller'
       })
