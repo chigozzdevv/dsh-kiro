@@ -1,9 +1,49 @@
 import { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
+import { apply as applyAcp } from '@deepseek-ai/dsh-subagent-acp'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 
 const PROVIDER = 'kiro-acp'
-const MODEL_ID = 'kiro-cli'
-const ACP_PROVIDER = 'acp_kiro'
+const KIRO_CLI = join(homedir(), '.local', 'bin', 'kiro-cli')
+const CATALOG_TTL_MS = 60_000
+const USAGE_TTL_MS = 5 * 60_000
+const COMMAND_TIMEOUT_MS = 15_000
+
+const effortLevels: Record<string, readonly string[]> = {
+  'claude-opus-5': ['low', 'medium', 'high', 'xhigh', 'max'],
+  'claude-opus-4.8': ['low', 'medium', 'high', 'xhigh', 'max'],
+  'claude-opus-4.7': ['low', 'medium', 'high', 'xhigh', 'max'],
+  'claude-opus-4.6': ['low', 'medium', 'high', 'max'],
+  'claude-sonnet-5.5': ['low', 'medium', 'high'],
+  'claude-sonnet-5': ['low', 'medium', 'high', 'xhigh', 'max'],
+  'claude-sonnet-4.6': ['low', 'medium', 'high', 'max'],
+  'gpt-5.6-sol': ['low', 'medium', 'high', 'xhigh', 'max'],
+  'gpt-5.6-terra': ['low', 'medium', 'high', 'xhigh', 'max'],
+  'gpt-5.6-luna': ['low', 'medium', 'high', 'xhigh', 'max'],
+}
+
+interface KiroModel {
+  model_id: string
+  model_name: string
+  description?: string
+  context_window_tokens?: number
+  rate_multiplier?: number
+  rate_unit?: string
+}
+
+interface KiroUsage {
+  tier?: string
+  resets?: string
+  bonusRemaining: number
+  planRemaining: number
+  totalRemaining: number
+}
+
+interface KiroSnapshot {
+  models: KiroModel[]
+  usage?: KiroUsage
+}
 
 function blockText(block: any): string {
   if (!block || typeof block !== 'object') return ''
@@ -44,30 +84,238 @@ function outputText(blocks: any[]): string {
     .join('')
 }
 
+function parseCredits(output: string): KiroUsage | undefined {
+  const number = (value: string) => Number(value.replaceAll(',', ''))
+  let bonusRemaining = 0
+  let bonusFound = false
+  for (const match of output.matchAll(/^\s*[^:\n]+:\s*([\d,.]+)\s*\/\s*([\d,.]+)\s*credits used\b/gim)) {
+    const used = number(match[1] ?? '')
+    const total = number(match[2] ?? '')
+    if (Number.isFinite(used) && Number.isFinite(total)) {
+      bonusRemaining += Math.max(0, total - used)
+      bonusFound = true
+    }
+  }
+
+  const planMatch = output.match(/Credits\s*\(\s*([\d,.]+)\s+of\s+([\d,.]+)\s+covered in plan\s*\)/i)
+  const planUsed = planMatch ? number(planMatch[1] ?? '') : 0
+  const planTotal = planMatch ? number(planMatch[2] ?? '') : 0
+  const planRemaining = planMatch && Number.isFinite(planUsed) && Number.isFinite(planTotal)
+    ? Math.max(0, planTotal - planUsed)
+    : 0
+  if (!bonusFound && !planMatch) return undefined
+
+  const header = output.match(/Estimated Usage\s*\|\s*(?:resets on\s+([^|]+?)\s*\|\s*)?([^\n]+)/i)
+  const tier = header?.[2]?.trim()
+  const resets = header?.[1]?.trim()
+  return {
+    ...(tier ? { tier } : {}),
+    ...(resets ? { resets } : {}),
+    bonusRemaining,
+    planRemaining,
+    totalRemaining: bonusRemaining + planRemaining,
+  }
+}
+
+function formatCredits(value: number): string {
+  return value.toLocaleString('en-US', { maximumFractionDigits: 2 })
+}
+
+function modelLabel(id: string): string {
+  if (id === 'auto') return 'Auto'
+  if (id.startsWith('claude-')) return `Claude ${id.slice(7).replaceAll('-', ' ').replace(/\b\w/g, (c) => c.toUpperCase())}`
+  if (id.startsWith('gpt-')) return `GPT-${id.slice(4).replaceAll('-', ' ').replace(/\b\w/g, (c) => c.toUpperCase())}`
+  if (id.startsWith('deepseek-')) return `DeepSeek ${id.slice(9).replaceAll('-', ' ').toUpperCase()}`
+  if (id.startsWith('minimax-')) return `MiniMax ${id.slice(8).toUpperCase()}`
+  if (id.startsWith('qwen')) return id.replaceAll('-', ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+  if (id.startsWith('glm-')) return `GLM-${id.slice(4).toUpperCase()}`
+  if (id.startsWith('grok-')) return `Grok ${id.slice(5)}`
+  if (id.startsWith('kimi-')) return `Kimi ${id.slice(5).toUpperCase()}`
+  return id
+}
+
+function modelDescription(model: KiroModel, usage?: KiroUsage): string {
+  const details = [model.description]
+  if (typeof model.context_window_tokens === 'number') {
+    details.push(`${formatCredits(model.context_window_tokens / 1_000_000)}M context`)
+  }
+  if (typeof model.rate_multiplier === 'number') {
+    details.push(`${model.rate_multiplier}× credit rate`)
+  }
+  if (usage) {
+    const balance = [
+      `${formatCredits(usage.totalRemaining)} credits remaining`,
+      ...(usage.bonusRemaining > 0 ? [`${formatCredits(usage.bonusRemaining)} bonus`] : []),
+      ...(usage.planRemaining > 0 ? [`${formatCredits(usage.planRemaining)} plan`] : []),
+    ].join(' · ')
+    details.push(`${usage.tier ? `${usage.tier} · ` : ''}${balance}${usage.resets ? ` · resets ${usage.resets}` : ''}`)
+  }
+  return details.filter(Boolean).join(' · ')
+}
+
+async function readStream(stream: any): Promise<string> {
+  if (!stream) return ''
+  const chunks: string[] = []
+  for await (const chunk of stream) chunks.push(String(chunk))
+  return chunks.join('')
+}
+
+async function runKiroCommand(ctx: any, args: string[]): Promise<string> {
+  const controller = new AbortController()
+  const child = ctx.subprocess.spawn({
+    argv: [KIRO_CLI, ...args],
+    cwd: homedir(),
+    stdio: { stdin: 'ignore', stdout: 'pipe', stderr: { maxBytes: 16_384 } },
+    graceMs: 1_000,
+    signal: controller.signal,
+  })
+  const stdout = readStream(child.stdout).catch(() => '')
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    const result = await Promise.race([
+      child.done.then((outcome: any) => ({ outcome })),
+      new Promise<{ timedOut: true }>((resolve) => {
+        timeout = setTimeout(() => resolve({ timedOut: true }), COMMAND_TIMEOUT_MS)
+      }),
+    ])
+    if ('timedOut' in result) {
+      controller.abort()
+      await child.waitForExit().catch(() => undefined)
+      throw new Error('Kiro CLI command timed out.')
+    }
+    const text = await stdout
+    if (result.outcome.exitCode !== 0) throw new Error(`Kiro CLI command exited with code ${result.outcome.exitCode ?? 'unknown'}.`)
+    return text
+  } finally {
+    if (timeout) clearTimeout(timeout)
+  }
+}
+
+function fallbackSnapshot(): KiroSnapshot {
+  return {
+    models: [{
+      model_id: 'auto',
+      model_name: 'auto',
+      description: 'Kiro CLI model catalog is unavailable. Check that Kiro is installed and signed in.',
+    }],
+  }
+}
+
 class KiroAcpAdapter extends LlmAdapter {
+  private snapshot: { expiresAt: number; value: KiroSnapshot } | undefined
+  private loading: Promise<KiroSnapshot> | undefined
+  private usageSnapshot: { expiresAt: number; value?: KiroUsage } | undefined
+  private usageLoading: Promise<KiroUsage | undefined> | undefined
+  private readonly registeredAcpProviders = new Set<string>()
+
   constructor(private readonly ctx: any) { super() }
 
   providerInfo(provider: string) {
     return { id: provider, name: 'Kiro via ACP' }
   }
 
+  private async discover(): Promise<KiroSnapshot> {
+    if (this.snapshot && this.snapshot.expiresAt > Date.now()) return this.snapshot.value
+    if (this.loading) return this.loading
+    this.loading = (async () => {
+      try {
+        const [catalogText, usage] = await Promise.all([
+          runKiroCommand(this.ctx, ['chat', '--list-models', '--format', 'json-pretty']),
+          this.discoverUsage(),
+        ])
+        const catalog = JSON.parse(catalogText)
+        const models = Array.isArray(catalog?.models)
+          ? catalog.models.filter((item: any) => typeof item?.model_id === 'string' && typeof item?.model_name === 'string')
+          : []
+        const value = models.length > 0
+          ? { models: models as KiroModel[], ...(usage ? { usage } : {}) }
+          : fallbackSnapshot()
+        this.snapshot = { expiresAt: Date.now() + CATALOG_TTL_MS, value }
+        return value
+      } catch {
+        const value = this.snapshot?.value ?? fallbackSnapshot()
+        this.snapshot = { expiresAt: Date.now() + CATALOG_TTL_MS, value }
+        return value
+      } finally {
+        this.loading = undefined
+      }
+    })()
+    return this.loading
+  }
+
+  private async discoverUsage(): Promise<KiroUsage | undefined> {
+    if (this.usageSnapshot && this.usageSnapshot.expiresAt > Date.now()) return this.usageSnapshot.value
+    if (this.usageLoading) return this.usageLoading
+    this.usageLoading = (async () => {
+      try {
+        const output = await runKiroCommand(this.ctx, ['chat', '--no-interactive', '/usage'])
+        const value = parseCredits(output)
+        this.usageSnapshot = { expiresAt: Date.now() + USAGE_TTL_MS, ...(value ? { value } : {}) }
+        return value
+      } catch {
+        this.usageSnapshot = { expiresAt: Date.now() + USAGE_TTL_MS }
+        return undefined
+      } finally {
+        this.usageLoading = undefined
+      }
+    })()
+    return this.usageLoading
+  }
+
   async listModels(provider: string) {
-    return [{
+    const snapshot = await this.discover()
+    return snapshot.models.map((model) => ({
       provider,
-      id: MODEL_ID,
-      name: 'Kiro CLI',
-      description: 'Kiro CLI agent over the configured ACP connection.'
-    }]
+      id: model.model_id,
+      name: modelLabel(model.model_id),
+      description: modelDescription(model, snapshot.usage),
+      inputModalities: ['text'] as const,
+      ...(snapshot.usage ? {
+        badge: { text: `${formatCredits(snapshot.usage.totalRemaining)} credits left`, tone: 'info' as const },
+      } : {}),
+    }))
   }
 
   async resolveModel(provider: string, model: string) {
+    const snapshot = await this.discover()
+    const entry = snapshot.models.find((candidate) => candidate.model_id === model)
+    const efforts = effortLevels[model]
     return {
       provider,
       id: model,
-      name: model === MODEL_ID ? 'Kiro CLI' : model,
-      description: 'Kiro CLI agent over the configured ACP connection.',
-      inputModalities: ['text'] as const
+      name: modelLabel(model),
+      description: entry ? modelDescription(entry, snapshot.usage) : 'Kiro CLI agent over the configured ACP connection.',
+      inputModalities: ['text'] as const,
+      ...(typeof entry?.context_window_tokens === 'number'
+        ? { context: { contextWindow: entry.context_window_tokens } }
+        : {}),
+      ...(efforts ? {
+        reasoning: {
+          efforts: efforts.map((id) => ({ id: id as any, name: id === 'xhigh' ? 'Extra high' : `${id[0]?.toUpperCase()}${id.slice(1)}` })),
+        },
+      } : {}),
     }
+  }
+
+  private acpProvider(model: string, effort?: string): string {
+    const providerName = `kiro-acp-${model}-${effort ?? 'default'}`
+    if (!this.registeredAcpProviders.has(providerName)) {
+      applyAcp(this.ctx, {
+        providerName,
+        command: KIRO_CLI,
+        args: [
+          'acp',
+          '--model', model,
+          ...(effort ? ['--effort', effort] : []),
+        ],
+        permission: 'allow',
+        env: {},
+        disposeEofGraceMs: 6_000,
+        disposeGraceMs: 3_000,
+      })
+      this.registeredAcpProviders.add(providerName)
+    }
+    return providerName
   }
 
   async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
@@ -77,11 +325,12 @@ class KiroAcpAdapter extends LlmAdapter {
     const parent = await this.ctx.agents.get(options.sessionId)
     if (!parent) throw new Error('Kiro via ACP could not find the active Harness agent.')
 
+    const provider = this.acpProvider(options.model || 'auto', options.reasoningEffort)
     let activation: any
     try {
       activation = await this.ctx.subagents.startActivation({
-        provider: ACP_PROVIDER,
-        label: 'Kiro model response',
+        provider,
+        label: `Kiro ${modelLabel(options.model || 'auto')} response`,
         request: {
           prompt: [{ type: 'text', text: transcript(options) }],
           parent
@@ -118,12 +367,14 @@ class KiroAcpAdapter extends LlmAdapter {
       throw new Error(`Kiro ACP execution failed: ${detail}`)
     } finally {
       if (activation) await activation.dispose()
+      this.snapshot = undefined
+      this.ctx.emit?.('llm/models-updated', PROVIDER)
     }
   }
 }
 
 export const name = 'dsh-kiro'
-export const inject = ['llm', 'agents', 'subagents']
+export const inject = ['llm', 'agents', 'subagents', 'subprocess']
 
 export function apply(ctx: any): void {
   ctx.llm.registerAdapter([PROVIDER], new KiroAcpAdapter(ctx))

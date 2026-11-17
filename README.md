@@ -4,16 +4,16 @@ A selectable Kiro entry for DeepSeek Harness. This fork calls Kiro CLI through i
 
 ## How it works
 
-The plugin registers **Kiro via ACP** in the normal DSH model picker. A model request is passed to the existing DSH ACP subagent provider named `acp_kiro`, which launches the configured Kiro CLI ACP process. Kiro uses its own model, tools, and signed-in account, then returns its final text to DSH.
+The plugin registers Kiro in DSH's normal model picker and reads the signed-in account's available models, context sizes, and credit rates from `kiro-cli chat --list-models`. It also reads the current balance from Kiro CLI's `/usage` command. The model catalog is cached for up to one minute; the balance is cached for up to five minutes and refreshed after a Kiro response when that cache expires.
 
-Choose **Kiro CLI** in the model picker. The displayed model follows Kiro CLI's active agent/model configuration; this plugin does not expose a separate model menu.
+Choose a Kiro model in the picker. DSH exposes effort levels for models whose supported options are documented by Kiro. The selected model and effort are passed to Kiro's ACP server at startup. Kiro runs its own tools in the selected workspace, then returns its final text to DSH.
 
 ## Requirements
 
 - DeepSeek Harness with its ACP subagent package enabled.
-- A DSH ACP provider named `acp_kiro` configured to run `kiro-cli acp` (or the full path to that command).
+- DSH's subprocess and ACP subagent services.
 - Kiro CLI installed and signed in.
-- The DSH ACP permission policy must allow the Kiro CLI tools you want it to use.
+- Kiro tool permission requests are automatically allowed by this adapter, matching the configured DSH `allow` policy.
 
 Install from the DSH plugin manager with:
 
@@ -23,9 +23,11 @@ github:chigozzdevv/dsh-kiro#acp-model-provider
 
 ## Limits
 
-This is a selectable DSH model route backed by an ACP agent. It returns the child's final answer after the ACP run completes, so it does not show token-by-token output. DSH's tool schemas, image attachments, and file attachments are not forwarded; Kiro uses its own ACP tools and can work in the selected workspace when its permissions allow it.
+This is a selectable DSH model route backed by an ACP agent. It returns the child's final answer after the ACP run completes, so it does not show token-by-token output. DSH's tool schemas, image attachments, and file attachments are not forwarded; Kiro uses its own ACP tools in the selected workspace.
 
-ACP's result does not include Kiro token counts, so this adapter does not report per-request usage. Requests use the Kiro CLI account and may consume Kiro credits. They do not require DeepSeek credits.
+ACP's result does not include per-request token counts. The model picker shows Kiro's account balance and each model's credit-rate multiplier when Kiro CLI reports them. Requests use the Kiro CLI account and may consume Kiro credits. They do not require DeepSeek credits.
+
+Kiro exposes only some effort choices for some models. This adapter lists the choices documented by Kiro and leaves the control out for models without documented effort support.
 
 ## Upstream
 
