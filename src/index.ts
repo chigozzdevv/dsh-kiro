@@ -153,6 +153,11 @@ function modelDescription(model: KiroModel, usage?: KiroUsage): string {
   return details.filter(Boolean).join(' · ')
 }
 
+function modelPickerName(model: KiroModel, usage?: KiroUsage): string {
+  const name = modelLabel(model.model_id)
+  return usage ? `${name} · ${formatCredits(usage.totalRemaining)} credits left` : name
+}
+
 async function readStream(stream: any): Promise<string> {
   if (!stream) return ''
   const chunks: string[] = []
@@ -267,7 +272,7 @@ class KiroAcpAdapter extends LlmAdapter {
     return snapshot.models.map((model) => ({
       provider,
       id: model.model_id,
-      name: modelLabel(model.model_id),
+      name: modelPickerName(model, snapshot.usage),
       description: modelDescription(model, snapshot.usage),
       inputModalities: ['text'] as const,
       ...(snapshot.usage ? {
@@ -283,7 +288,7 @@ class KiroAcpAdapter extends LlmAdapter {
     return {
       provider,
       id: model,
-      name: modelLabel(model),
+      name: modelPickerName(entry ?? { model_id: model, model_name: model }, snapshot.usage),
       description: entry ? modelDescription(entry, snapshot.usage) : 'Kiro CLI agent over the configured ACP connection.',
       inputModalities: ['text'] as const,
       ...(typeof entry?.context_window_tokens === 'number'
