@@ -1,7 +1,7 @@
 {
   "name": "dsh-kiro",
   "description": "Kiro CLI model provider for DeepSeek Harness via the supported ACP interface",
-  "version": "0.2.0-acp.5",
+  "version": "0.2.0-acp.6",
   "type": "module",
   "license": "MIT",
   "author": {

@@ -224,18 +224,21 @@ class KiroAcpAdapter extends LlmAdapter {
     if (this.loading) return this.loading
     this.loading = (async () => {
       try {
-        // Kiro CLI commands share local account/session state. Run them in
-        // sequence so model discovery cannot collide with the usage query.
         const catalogText = await runKiroCommand(this.ctx, ['chat', '--list-models', '--format', 'json-pretty'])
-        const usage = await this.discoverUsage()
         const catalog = JSON.parse(catalogText)
         const models = Array.isArray(catalog?.models)
           ? catalog.models.filter((item: any) => typeof item?.model_id === 'string' && typeof item?.model_name === 'string')
           : []
+        const usage = this.usageSnapshot && this.usageSnapshot.expiresAt > Date.now()
+          ? this.usageSnapshot.value
+          : undefined
         const value = models.length > 0
           ? { models: models as KiroModel[], ...(usage ? { usage } : {}) }
           : fallbackSnapshot()
         this.snapshot = { expiresAt: Date.now() + CATALOG_TTL_MS, value }
+        // Keep the picker responsive if Kiro's separate usage command takes
+        // longer than model discovery. A later update refreshes the picker.
+        void this.discoverUsage()
         return value
       } catch {
         const value = this.snapshot?.value ?? fallbackSnapshot()
@@ -256,9 +259,17 @@ class KiroAcpAdapter extends LlmAdapter {
         const output = await runKiroCommand(this.ctx, ['chat', '--no-interactive', '/usage'])
         const value = parseCredits(output)
         this.usageSnapshot = { expiresAt: Date.now() + USAGE_TTL_MS, ...(value ? { value } : {}) }
+        if (value && this.snapshot) {
+          this.snapshot = {
+            ...this.snapshot,
+            value: { ...this.snapshot.value, usage: value },
+          }
+          this.ctx.emit?.('llm/models-updated', PROVIDER)
+        }
         return value
-      } catch {
-        this.usageSnapshot = { expiresAt: Date.now() + USAGE_TTL_MS }
+      } catch (error) {
+        this.usageSnapshot = { expiresAt: Date.now() + 60_000 }
+        this.ctx.logger?.warn?.(`dsh-kiro: Kiro credit lookup failed: ${error instanceof Error ? error.message : String(error)}`)
         return undefined
       } finally {
         this.usageLoading = undefined
