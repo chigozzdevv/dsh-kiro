@@ -4,14 +4,14 @@ A selectable Kiro entry for DeepSeek Harness. This fork calls Kiro CLI through i
 
 ## How it works
 
-The plugin registers **Kiro via ACP** in the normal DSH model picker. A model request is passed to the existing DSH ACP subagent provider named `kiro`, which launches the configured Kiro CLI ACP process. Kiro uses its own model, tools, and signed-in account, then returns its final text to DSH.
+The plugin registers **Kiro via ACP** in the normal DSH model picker. A model request is passed to the existing DSH ACP subagent provider named `acp_kiro`, which launches the configured Kiro CLI ACP process. Kiro uses its own model, tools, and signed-in account, then returns its final text to DSH.
 
 Choose **Kiro CLI** in the model picker. The displayed model follows Kiro CLI's active agent/model configuration; this plugin does not expose a separate model menu.
 
 ## Requirements
 
 - DeepSeek Harness with its ACP subagent package enabled.
-- A DSH ACP provider named `kiro` configured to run `kiro-cli acp` (or the full path to that command).
+- A DSH ACP provider named `acp_kiro` configured to run `kiro-cli acp` (or the full path to that command).
 - Kiro CLI installed and signed in.
 - The DSH ACP permission policy must allow the Kiro CLI tools you want it to use.
 

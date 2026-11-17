@@ -3,7 +3,7 @@ import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 
 const PROVIDER = 'kiro-acp'
 const MODEL_ID = 'kiro-cli'
-const ACP_PROVIDER = 'kiro'
+const ACP_PROVIDER = 'acp_kiro'
 
 function blockText(block: any): string {
   if (!block || typeof block !== 'object') return ''
