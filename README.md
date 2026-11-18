@@ -23,7 +23,7 @@ github:chigozzdevv/dsh-kiro#acp-model-provider
 
 ## Limits
 
-This is a selectable DSH model route backed by an ACP agent. It returns the child's final answer after the ACP run completes, so it does not show token-by-token output. DSH's tool schemas, image attachments, and file attachments are not forwarded; Kiro uses its own ACP tools in the selected workspace.
+This is a selectable DSH model route backed by an ACP agent. Kiro's user-facing text streams as it arrives. DSH also shows short progress updates from ACP tool categories, such as searching, reading, editing, or running a command. The adapter does not forward Kiro's private thought text, tool arguments, or tool output. DSH's tool schemas and non-text attachments are not forwarded; Kiro uses its own ACP tools in the selected workspace.
 
 ACP's result does not include per-request token counts. The model picker shows Kiro's account balance and each model's credit-rate multiplier when Kiro CLI reports them. Requests use the Kiro CLI account and may consume Kiro credits. They do not require DeepSeek credits.
 

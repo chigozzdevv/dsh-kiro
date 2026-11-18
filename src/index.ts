@@ -1,8 +1,8 @@
 import { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { apply as applyAcp } from '@deepseek-ai/dsh-subagent-acp'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { registerKiroAcp } from './acp/provider.js'
 
 const PROVIDER = 'kiro-acp'
 const KIRO_CLI = join(homedir(), '.local', 'bin', 'kiro-cli')
@@ -64,7 +64,7 @@ function transcript(options: GenerateOptions): string {
   const sections = [
     'You are the selected Kiro model inside DeepSeek Harness. Answer the latest user request in this transcript.',
     'Use tools available to your Kiro ACP session when workspace work is needed. The parent Harness tool schemas and non-text attachments are not passed through this adapter.',
-    'Treat earlier messages as context. Return the final answer only; do not claim work you did not complete.'
+    'Treat earlier messages as context. Give brief user-facing progress updates before substantial actions, stating what you are doing at a high level. Then give the final answer. Do not claim work you did not complete.'
   ]
   if (typeof options.system === 'string' && options.system.length > 0) {
     sections.push(`===== SYSTEM =====\n${options.system}`)
@@ -84,6 +84,53 @@ function outputText(blocks: any[]): string {
     .filter((block) => block?.type === 'text' && typeof block.text === 'string')
     .map((block) => block.text)
     .join('')
+}
+
+type LiveUpdate = { kind: 'activity'; text: string } | { kind: 'text'; text: string }
+
+class AsyncQueue<T> implements AsyncIterable<T> {
+  private readonly values: T[] = []
+  private readonly waiters: Array<(item: IteratorResult<T>) => void> = []
+  private closed = false
+
+  push(value: T): void {
+    if (this.closed) return
+    const waiter = this.waiters.shift()
+    if (waiter) waiter({ value, done: false })
+    else this.values.push(value)
+  }
+
+  close(): void {
+    if (this.closed) return
+    this.closed = true
+    while (this.waiters.length > 0) this.waiters.shift()?.({ value: undefined, done: true })
+  }
+
+  private next(): Promise<IteratorResult<T>> {
+    const value = this.values.shift()
+    if (value !== undefined) return Promise.resolve({ value, done: false })
+    if (this.closed) return Promise.resolve({ value: undefined, done: true })
+    return new Promise(resolve => this.waiters.push(resolve))
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<T> {
+    return { next: () => this.next() }
+  }
+}
+
+function activityLabel(kind: string): string {
+  switch (kind) {
+    case 'search': return 'Searching the workspace'
+    case 'read': return 'Reading project files'
+    case 'edit': return 'Editing a file'
+    case 'delete': return 'Removing a file'
+    case 'move': return 'Moving a file'
+    case 'execute': return 'Running a command'
+    case 'fetch': return 'Fetching information'
+    case 'switch_mode': return 'Switching work mode'
+    case 'think': return 'Working through a task step'
+    default: return 'Using a tool'
+  }
 }
 
 function parseCredits(output: string): KiroUsage | undefined {
@@ -155,9 +202,8 @@ function modelDescription(model: KiroModel, usage?: KiroUsage): string {
   return details.filter(Boolean).join(' · ')
 }
 
-function modelPickerName(model: KiroModel, usage?: KiroUsage): string {
-  const name = modelLabel(model.model_id)
-  return usage ? `${name} · ${formatCredits(usage.totalRemaining)} credits left` : name
+function modelPickerName(model: KiroModel): string {
+  return modelLabel(model.model_id)
 }
 
 async function readStream(stream: any): Promise<string> {
@@ -214,6 +260,7 @@ class KiroAcpAdapter extends LlmAdapter {
   private usageSnapshot: { expiresAt: number; value?: KiroUsage } | undefined
   private usageLoading: Promise<KiroUsage | undefined> | undefined
   private readonly registeredAcpProviders = new Set<string>()
+  private readonly liveSinks = new Map<string, (update: LiveUpdate) => void>()
 
   constructor(private readonly ctx: any) { super() }
 
@@ -285,7 +332,7 @@ class KiroAcpAdapter extends LlmAdapter {
     return snapshot.models.map((model) => ({
       provider,
       id: model.model_id,
-      name: modelPickerName(model, snapshot.usage),
+      name: modelPickerName(model),
       description: modelDescription(model, snapshot.usage),
       inputModalities: ['text'] as const,
       ...(snapshot.usage ? {
@@ -301,7 +348,7 @@ class KiroAcpAdapter extends LlmAdapter {
     return {
       provider,
       id: model,
-      name: modelPickerName(entry ?? { model_id: model, model_name: model }, snapshot.usage),
+      name: modelPickerName(entry ?? { model_id: model, model_name: model }),
       description: entry ? modelDescription(entry, snapshot.usage) : 'Kiro CLI agent over the configured ACP connection.',
       inputModalities: ['text'] as const,
       ...(typeof entry?.context_window_tokens === 'number'
@@ -318,7 +365,7 @@ class KiroAcpAdapter extends LlmAdapter {
   private acpProvider(model: string, effort?: string): string {
     const providerName = `kiro-acp-${model}-${effort ?? 'default'}`
     if (!this.registeredAcpProviders.has(providerName)) {
-      applyAcp(this.ctx, {
+      registerKiroAcp(this.ctx, {
         providerName,
         command: KIRO_CLI,
         args: [
@@ -330,6 +377,10 @@ class KiroAcpAdapter extends LlmAdapter {
         env: {},
         disposeEofGraceMs: 6_000,
         disposeGraceMs: 3_000,
+        onActivity: (parentSessionId, kind) => this.liveSinks.get(parentSessionId)?.({
+          kind: 'activity', text: activityLabel(kind),
+        }),
+        onText: (parentSessionId, text) => this.liveSinks.get(parentSessionId)?.({ kind: 'text', text }),
       })
       this.registeredAcpProviders.add(providerName)
     }
@@ -345,6 +396,14 @@ class KiroAcpAdapter extends LlmAdapter {
 
     const provider = this.acpProvider(options.model || 'auto', options.reasoningEffort)
     let activation: any
+    const live = new AsyncQueue<LiveUpdate>()
+    let progressText = ''
+    let streamedText = ''
+    let nextBlockIndex = 0
+    let reasoningIndex: number | undefined
+    let textIndex: number | undefined
+    const parentSessionId = String(parent.id)
+    this.liveSinks.set(parentSessionId, update => live.push(update))
     try {
       activation = await this.ctx.subagents.startActivation({
         provider,
@@ -357,12 +416,44 @@ class KiroAcpAdapter extends LlmAdapter {
         delivery: 'caller'
       })
     } catch (error) {
+      live.close()
+      this.liveSinks.delete(parentSessionId)
       const detail = error instanceof Error ? error.stack ?? error.message : String(error)
       throw new Error(`Kiro ACP activation failed: ${detail}`)
     }
 
     try {
-      const result = await activation.result
+      const resultPromise = activation.result.then(
+        (result: any) => {
+          live.close()
+          return { ok: true as const, result }
+        },
+        (error: unknown) => {
+          live.close()
+          return { ok: false as const, error }
+        },
+      )
+      for await (const update of live) {
+        if (update.kind === 'activity') {
+          if (reasoningIndex === undefined) {
+            reasoningIndex = nextBlockIndex++
+            yield { type: 'block-start', index: reasoningIndex, blockType: 'reasoning' }
+          }
+          const line = `${update.text}.\n`
+          progressText += line
+          yield { type: 'reasoning-delta', index: reasoningIndex, text: line }
+        } else {
+          if (textIndex === undefined) {
+            textIndex = nextBlockIndex++
+            yield { type: 'block-start', index: textIndex, blockType: 'text' }
+          }
+          streamedText += update.text
+          yield { type: 'text-delta', index: textIndex, text: update.text }
+        }
+      }
+      const settled = await resultPromise
+      if (!settled.ok) throw settled.error
+      const result = settled.result
       if (signal.aborted || result.stopReason === 'aborted') {
         throw new DOMException('Kiro ACP request was cancelled.', 'AbortError')
       }
@@ -373,9 +464,19 @@ class KiroAcpAdapter extends LlmAdapter {
       const text = outputText(result.output)
       if (!text.trim()) throw new Error('Kiro ACP returned no assistant text.')
 
-      yield { type: 'block-start', index: 0, blockType: 'text' }
-      yield { type: 'text-delta', index: 0, text }
-      yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+      if (reasoningIndex !== undefined) {
+        yield { type: 'block-end', index: reasoningIndex, block: { type: 'reasoning', text: progressText } }
+      }
+      if (textIndex === undefined) {
+        textIndex = nextBlockIndex++
+        yield { type: 'block-start', index: textIndex, blockType: 'text' }
+        yield { type: 'text-delta', index: textIndex, text }
+      } else if (text.startsWith(streamedText) && text.length > streamedText.length) {
+        const remainder = text.slice(streamedText.length)
+        streamedText += remainder
+        yield { type: 'text-delta', index: textIndex, text: remainder }
+      }
+      yield { type: 'block-end', index: textIndex, block: { type: 'text', text: streamedText || text } }
       yield {
         type: 'finish',
         reason: result.stopReason === 'max-tokens' ? { kind: 'max-tokens' } : { kind: 'stop' }
@@ -384,6 +485,8 @@ class KiroAcpAdapter extends LlmAdapter {
       const detail = error instanceof Error ? error.message : String(error)
       throw new Error(`Kiro ACP execution failed: ${detail}`)
     } finally {
+      live.close()
+      this.liveSinks.delete(parentSessionId)
       if (activation) await activation.dispose()
       this.snapshot = undefined
       this.ctx.emit?.('llm/models-updated', PROVIDER)
