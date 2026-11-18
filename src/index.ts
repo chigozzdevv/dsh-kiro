@@ -12,12 +12,14 @@ const COMMAND_TIMEOUT_MS = 15_000
 
 const effortLevels: Record<string, readonly string[]> = {
   'claude-opus-5': ['low', 'medium', 'high', 'xhigh', 'max'],
+  'claude-opus-5.5': ['low', 'medium', 'high', 'xhigh', 'max'],
   'claude-opus-4.8': ['low', 'medium', 'high', 'xhigh', 'max'],
   'claude-opus-4.7': ['low', 'medium', 'high', 'xhigh', 'max'],
   'claude-opus-4.6': ['low', 'medium', 'high', 'max'],
-  'claude-sonnet-5.5': ['low', 'medium', 'high'],
+  'claude-sonnet-5.5': ['low', 'medium', 'high', 'xhigh', 'max'],
   'claude-sonnet-5': ['low', 'medium', 'high', 'xhigh', 'max'],
   'claude-sonnet-4.6': ['low', 'medium', 'high', 'max'],
+  'claude-haiku-5.5': ['low', 'medium', 'high', 'xhigh', 'max'],
   'gpt-5.6-sol': ['low', 'medium', 'high', 'xhigh', 'max'],
   'gpt-5.6-terra': ['low', 'medium', 'high', 'xhigh', 'max'],
   'gpt-5.6-luna': ['low', 'medium', 'high', 'xhigh', 'max'],
